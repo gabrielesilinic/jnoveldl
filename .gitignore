@@ -1,0 +1,7 @@
+audiobooks
+downloads
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+onnx-model

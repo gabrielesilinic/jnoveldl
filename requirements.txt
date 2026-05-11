@@ -1,0 +1,10 @@
+requests
+keyring
+numpy
+soundfile
+beautifulsoup4
+EbookLib
+tqdm
+kokoro
+kokoro-onnx
+onnxruntime
