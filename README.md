@@ -24,5 +24,22 @@ python tui.py
 
 at this point it should let you input credentials and such at the first run. note that this project tries to use a keyring whenever possible however it has cases when it may not. it is not exactly the height of security however I have to keep it as such due to different platform APIs and my desire to be able to use it via an SSH session where stuff like the gnome keyring may not be available.
 
+## UI backends
+
+There are two interactive backends:
+
+- **curses** — full-screen, arrow-key driven. Default on Linux/macOS.
+- **plain** — numbered-menu REPL using the standard library only. Default on Windows and any environment where `curses` isn't available. Type `?` at any prompt for in-app help.
+
+Pick one explicitly with:
+
+```bash
+python tui.py --backend curses      # force curses
+python tui.py --backend plain       # force plain REPL
+python tui.py --no-curses           # alias for --backend plain
+```
+
+Both backends share the same selection model and the same download/convert flow afterwards. Adding a future GUI is a matter of subclassing `LibraryUI` in the `ui/` package.
+
 # Support
 This project is Linux first. I will never purpusefully break support for windows or mac but I may not be able to test on those platforms or not willing to. this project is meant to run on an Ubuntu 24.04 workstation (ubuntu desktop) mounting an AMD 7900xtx via Pytorch ROCM first and foremost. however it is not like it won't work elsewhere.

@@ -27,6 +27,8 @@ from tts.kokoro_tts_inference_engine import KokoroTTSInferenceEngine as ActiveTT
 
 SR = 24000
 AAC_BITRATE = "64k"
+OPUS_BITRATE = "32k"
+OPUS_SR = 48000
 PLACEHOLDER_AUTHOR = "TTS Placeholder"
 AUDIOBOOK_DIR = Path("audiobooks")
 
@@ -50,8 +52,92 @@ def _write_ffmetadata(path: str, title: str | None, author: str, chapters):
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
+def determine_device() -> str:
+    """Determine the best available device for TTS inference."""
+    import torch
+    if torch.cuda.is_available():
+        return "cuda"
+    else:
+        print("GPU acceleration not available, using CPU (this will be slower!)")
+        return "cpu"
 
-_tts_engine = ActiveTTSInferenceEngine()
+bkstr = determine_device()
+
+_tts_engine = ActiveTTSInferenceEngine(device=bkstr)
+
+
+def bake_m4b_to_mka(
+    m4b_path: str | Path,
+    output_path: str | Path | None = None,
+    bitrate: str = OPUS_BITRATE,
+) -> Path:
+    """Re-encode an existing M4B into an Opus MKA at 48000 Hz.
+
+    Optional size-saving measure for very large audiobooks (e.g. long web
+    novels). Preserves tags, chapters, and embeds the cover art as a
+    Matroska attachment. Returns the Path to the finished .mka file.
+    """
+    m4b_path = Path(m4b_path)
+    if not m4b_path.exists():
+        raise FileNotFoundError(f"M4B not found: {m4b_path}")
+
+    if output_path is None:
+        output_path = m4b_path.with_suffix(".mka")
+    output_path = Path(output_path)
+
+    # ── Extract cover (attached_pic video stream), if any ─────
+    probe = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v",
+            "-show_entries", "stream=codec_name", "-of", "csv=p=0",
+            str(m4b_path),
+        ],
+        capture_output=True, text=True,
+    )
+    cover_codec = probe.stdout.strip().splitlines()[0] if probe.stdout.strip() else None
+
+    tmp_cover: Path | None = None
+    attach_args: list[str] = []
+    if cover_codec:
+        ext = ".png" if cover_codec == "png" else ".jpg"
+        mime = "image/png" if ext == ".png" else "image/jpeg"
+        tmp_cover = output_path.parent / f".{output_path.stem}.cover{ext}"
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", str(m4b_path),
+                "-map", "0:v", "-frames:v", "1", "-c", "copy",
+                str(tmp_cover),
+            ],
+            check=True,
+        )
+        attach_args = [
+            "-attach", str(tmp_cover),
+            "-metadata:s:t:0", f"mimetype={mime}",
+            "-metadata:s:t:0", f"filename=cover{ext}",
+        ]
+
+    tmp_out = output_path.parent / f"{output_path.stem}.part.mka"
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "warning",
+        "-i", str(m4b_path),
+        "-map", "0:a",
+        "-map_metadata", "0", "-map_chapters", "0",
+        *attach_args,
+        "-threads", "auto",
+        "-ar", str(OPUS_SR), "-c:a", "libopus", "-b:a", bitrate,
+        "-f", "matroska",
+        str(tmp_out),
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+        tmp_out.replace(output_path)
+    finally:
+        tmp_out.unlink(missing_ok=True)
+        if tmp_cover is not None:
+            tmp_cover.unlink(missing_ok=True)
+
+    return output_path
 
 
 # ══════════════════════════════════════════════════════════════

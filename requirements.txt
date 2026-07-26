@@ -5,6 +5,7 @@ soundfile
 beautifulsoup4
 EbookLib
 tqdm
-kokoro
+kokoro==0.9.4
 kokoro-onnx
 onnxruntime
+spacy

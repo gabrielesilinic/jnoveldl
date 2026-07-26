@@ -1,0 +1,21 @@
+services:
+  jnoveldl:
+    build:
+      context: .
+      args:
+        UID: "${UID:-1000}"
+        GID: "${GID:-1000}"
+    image: jnoveldl:local
+    # Belt-and-suspenders: even if the image was built elsewhere, run as host user.
+    user: "${UID:-1000}:${GID:-1000}"
+    command: python tui.py
+    environment:
+      HOME: /app/config
+      TERM: "${TERM:-xterm-256color}"
+      HF_TOKEN: "${HF_TOKEN:-}"
+    volumes:
+      - ./audiobooks:/app/audiobooks
+      - ./downloads:/app/downloads
+      - ${HOME:-${USERPROFILE}}/.config/jnoveldl:/app/config
+    stdin_open: true
+    tty: true

@@ -1,40 +1,55 @@
 #!/usr/bin/env python3
-"""jnoveldl — curses TUI for browsing and downloading your J-Novel Club library.
+"""jnoveldl — TUI for browsing and downloading your J-Novel Club library.
 
-Series list:
+Two UI backends are available:
+
+  * curses (default on Linux/macOS) — full-screen, arrow-key driven.
+  * plain  (default on Windows, also via --no-curses) — numbered-menu REPL,
+    stdlib only, works in dumb terminals.
+
+Use --backend {curses,plain,auto} or --no-curses to choose explicitly.
+
+Curses bindings — series list:
   ↑/↓       navigate            Space  toggle all volumes in series
-  Enter      drill into volumes  d      download selected
-  c          download + convert to m4b
-  q          quit
-
-Volume list (inside a series):
+  Enter     drill into volumes  d      download selected
+  c         download + convert to m4b  q  quit
+Curses bindings — volume list:
   ↑/↓       navigate            Space  toggle volume
-  a          select all          n      deselect all
-  Esc        back to series
+  a         select all          n      deselect all
+  e         extend m4b          m      bake m4b → Opus MKA (48 kHz)
+  Esc       back to series
+
+Plain backend: type '?' at any prompt for in-app help.
 """
 
-import curses
 import argparse
 import sys
-import time
 from pathlib import Path
 
-from bookconvert import convert_epub_to_m4b
 from jnoveldl import (
     JNCApi,
     bake_credentials_from_keyring,
     clear_credentials,
-    download_epub,
     get_stored_credentials,
     is_keyring_available,
     parse_library,
     prompt_credentials,
     store_credentials,
 )
+from ui import (
+    Action,
+    LibraryController,
+    build_entries,
+    build_extras_entry,
+    collect_downloadable_books,
+    gather_selected_books,
+    get_ui,
+)
+from ui.plain_ui import PlainUI
 
 DOWNLOAD_DIR = Path("downloads")
+EXTRAS_DIR = DOWNLOAD_DIR / "extras"
 AUDIOBOOK_DIR = Path("audiobooks")
-DOWNLOAD_DELAY = 2        # seconds between consecutive downloads
 
 
 def _collect_long_options(parser: argparse.ArgumentParser) -> list[str]:
@@ -82,11 +97,34 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Download all missing EPUBs from your library and exit",
     )
+    parser.add_argument(
+        "--backend",
+        choices=["curses", "plain", "auto"],
+        default="auto",
+        help="UI backend (default: auto — curses on Linux/macOS, plain on Windows)",
+    )
+    parser.add_argument(
+        "--no-curses",
+        action="store_true",
+        help="Alias for --backend plain (forces the plain-text REPL UI)",
+    )
     return parser
 
 
 def parse_args(parser: argparse.ArgumentParser) -> argparse.Namespace:
     return parser.parse_args()
+
+
+def resolve_backend(args: argparse.Namespace) -> str:
+    """Resolve CLI flags to a backend name ('curses', 'plain', or 'auto')."""
+    if args.no_curses and args.backend not in (None, "auto", "plain"):
+        print(
+            f"Warning: --no-curses overridden by --backend {args.backend}",
+            file=sys.stderr,
+        )
+    if args.no_curses and args.backend in (None, "auto"):
+        return "plain"
+    return args.backend or "auto"
 
 
 def run_bake_credentials() -> int:
@@ -127,314 +165,19 @@ def ensure_login() -> tuple[JNCApi, dict]:
     return api, me
 
 
-# ── data model ───────────────────────────────────────────────────────
-class SeriesEntry:
-    def __init__(self, sid: str, title: str, books: list[dict]):
-        self.sid = sid
-        self.title = title
-        self.books = books                          # sorted by vol number
-        self.selected: set[str] = set()             # book ids currently selected
-
-    @property
-    def n_selected(self) -> int:
-        return len(self.selected)
-
-    @property
-    def all_selected(self) -> bool:
-        return self.n_selected == len(self.books)
-
-    def toggle_all(self) -> None:
-        if self.all_selected:
-            self.selected.clear()
-        else:
-            self.selected = {b["id"] for b in self.books}
-
-    def toggle_book(self, book_id: str) -> None:
-        if book_id in self.selected:
-            self.selected.discard(book_id)
-        else:
-            self.selected.add(book_id)
-
-    def select_all_books(self) -> None:
-        self.selected = {b["id"] for b in self.books}
-
-    def deselect_all_books(self) -> None:
-        self.selected.clear()
-
-
-def build_entries(grouped: dict[str, dict]) -> list[SeriesEntry]:
-    return [
-        SeriesEntry(sid, info["title"], info["books"])
-        for sid, info in grouped.items()
-    ]
-
-
-def gather_selected_books(entries: list[SeriesEntry]) -> list[dict]:
-    out: list[dict] = []
-    for e in entries:
-        for b in e.books:
-            if b["id"] in e.selected:
-                out.append(b)
-    return out
-
-
-# ── curses drawing helpers ───────────────────────────────────────────
-def _clamp(val: int, lo: int, hi: int) -> int:
-    return max(lo, min(val, hi))
-
-
-def _draw_bar(win, y: int, text: str, attr: int = 0) -> None:
-    h, w = win.getmaxyx()
-    if y < 0 or y >= h:
-        return
-    win.move(y, 0)
-    win.clrtoeol()
-    win.addnstr(y, 0, text, w - 1, attr)
-
-
-# ── series list view ─────────────────────────────────────────────────
-def draw_series_list(
-    win, entries: list[SeriesEntry], cursor: int, scroll: int, total_sel: int
-) -> None:
-    win.erase()
-    h, w = win.getmaxyx()
-    header = " J-Novel Club Library "
-    footer = " ↑↓:move  Space:toggle  Enter:volumes  d:download  c:dl+m4b  q:quit "
-    status = f" {total_sel} volume(s) selected "
-
-    # header
-    _draw_bar(win, 0, header.center(w - 1), curses.A_BOLD | curses.A_REVERSE)
-
-    # scrollable list area: rows 2 … h-3
-    list_top = 2
-    list_bot = h - 3
-    visible = list_bot - list_top
-
-    for i in range(visible):
-        idx = scroll + i
-        if idx >= len(entries):
-            break
-        e = entries[idx]
-        y = list_top + i
-
-        if e.all_selected:
-            mark = "[✓]"
-        elif e.n_selected > 0:
-            mark = "[-]"
-        else:
-            mark = "[ ]"
-
-        count = f"({e.n_selected}/{len(e.books)})"
-        line = f" {mark} {e.title}  {count}"
-
-        attr = curses.A_NORMAL
-        if idx == cursor:
-            attr = curses.A_REVERSE
-
-        win.move(y, 0)
-        win.clrtoeol()
-        win.addnstr(y, 0, line, w - 1, attr)
-
-    # status + footer
-    _draw_bar(win, h - 2, status.center(w - 1), curses.A_BOLD)
-    _draw_bar(win, h - 1, footer.center(w - 1), curses.A_DIM)
-    win.refresh()
-
-
-def series_list_view(win, entries: list[SeriesEntry]) -> str:
-    """Interactive series list. Returns 'download', 'quit', or 'back'."""
-    curses.curs_set(0)
-    cursor = 0
-    scroll = 0
-
-    while True:
-        h, w = win.getmaxyx()
-        visible = max(1, h - 5)
-        total_sel = sum(e.n_selected for e in entries)
-
-        # keep cursor in scroll window
-        if cursor < scroll:
-            scroll = cursor
-        if cursor >= scroll + visible:
-            scroll = cursor - visible + 1
-
-        draw_series_list(win, entries, cursor, scroll, total_sel)
-        key = win.getch()
-
-        if key == curses.KEY_UP or key == ord("k"):
-            cursor = _clamp(cursor - 1, 0, len(entries) - 1)
-        elif key == curses.KEY_DOWN or key == ord("j"):
-            cursor = _clamp(cursor + 1, 0, len(entries) - 1)
-        elif key == ord(" "):
-            entries[cursor].toggle_all()
-        elif key in (curses.KEY_ENTER, 10, 13):
-            volume_list_view(win, entries[cursor])
-        elif key == ord("d") or key == ord("D"):
-            return "download"
-        elif key == ord("c") or key == ord("C"):
-            return "convert"
-        elif key == ord("q") or key == ord("Q"):
-            return "quit"
-
-
-# ── volume list view (drill-down) ───────────────────────────────────
-def draw_volume_list(
-    win, entry: SeriesEntry, cursor: int, scroll: int
-) -> None:
-    win.erase()
-    h, w = win.getmaxyx()
-    header = f" {entry.title} "
-    footer = " ↑↓:move  Space:toggle  a:all  n:none  Esc:back "
-    status = f" {entry.n_selected}/{len(entry.books)} selected "
-
-    _draw_bar(win, 0, header.center(w - 1), curses.A_BOLD | curses.A_REVERSE)
-
-    list_top = 2
-    list_bot = h - 3
-    visible = list_bot - list_top
-
-    for i in range(visible):
-        idx = scroll + i
-        if idx >= len(entry.books):
-            break
-        bk = entry.books[idx]
-        y = list_top + i
-
-        mark = "[✓]" if bk["id"] in entry.selected else "[ ]"
-        line = f" {mark} Vol {bk['number']:>2}  {bk['title']}"
-
-        attr = curses.A_REVERSE if idx == cursor else curses.A_NORMAL
-        win.move(y, 0)
-        win.clrtoeol()
-        win.addnstr(y, 0, line, w - 1, attr)
-
-    _draw_bar(win, h - 2, status.center(w - 1), curses.A_BOLD)
-    _draw_bar(win, h - 1, footer.center(w - 1), curses.A_DIM)
-    win.refresh()
-
-
-def volume_list_view(win, entry: SeriesEntry) -> None:
-    """Drill-down into a single series' volumes."""
-    cursor = 0
-    scroll = 0
-
-    while True:
-        h, w = win.getmaxyx()
-        visible = max(1, h - 5)
-
-        if cursor < scroll:
-            scroll = cursor
-        if cursor >= scroll + visible:
-            scroll = cursor - visible + 1
-
-        draw_volume_list(win, entry, cursor, scroll)
-        key = win.getch()
-
-        if key == curses.KEY_UP or key == ord("k"):
-            cursor = _clamp(cursor - 1, 0, len(entry.books) - 1)
-        elif key == curses.KEY_DOWN or key == ord("j"):
-            cursor = _clamp(cursor + 1, 0, len(entry.books) - 1)
-        elif key == ord(" "):
-            entry.toggle_book(entry.books[cursor]["id"])
-        elif key == ord("a") or key == ord("A"):
-            entry.select_all_books()
-        elif key == ord("n") or key == ord("N"):
-            entry.deselect_all_books()
-        elif key == 27:  # Esc
-            return
-
-
-# ── download phase (outside curses) ─────────────────────────────────
-def run_downloads(books: list[dict]) -> None:
-    """Download selected books with a delay between each."""
-    capped = books
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    ok = 0
-    skipped = 0
-    for i, bk in enumerate(capped, 1):
-        link = bk.get("epub_link")
-        slug = bk.get("slug") or bk["id"]
-        dest = DOWNLOAD_DIR / f"{slug}.epub"
-
-        print(f"  [{i}/{len(capped)}] {bk['title']} … ", end="", flush=True)
-
-        if dest.exists():
-            print("skip (already exists)")
-            skipped += 1
-            continue
-
-        if not link:
-            print("✗ no EPUB link")
-            continue
-
-        try:
-            nbytes = download_epub(link, str(dest))
-            mb = nbytes / (1024 * 1024)
-            print(f"{mb:.1f} MB ✓")
-            ok += 1
-        except Exception as exc:
-            print(f"FAILED ({exc})")
-
-        if i < len(capped):
-            time.sleep(DOWNLOAD_DELAY)
-
-    print(f"\n  Done — {ok} downloaded, {skipped} skipped (already on disk).")
-
-
-def collect_downloadable_books(grouped: dict[str, dict]) -> list[dict]:
-    books: list[dict] = []
-    for info in grouped.values():
-        for bk in info["books"]:
-            if bk.get("epub_link"):
-                books.append(bk)
-    return books
-
-
-# ── conversion phase (outside curses) ────────────────────────────────
-def run_conversions(books: list[dict]) -> None:
-    """Convert downloaded EPUBs to M4B audiobooks, skipping existing."""
-    AUDIOBOOK_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Filter to the books that actually need conversion
-    to_convert: list[tuple[int, dict, Path, Path]] = []
-    skipped = 0
-    for i, bk in enumerate(books, 1):
-        slug = bk.get("slug") or bk["id"]
-        epub_path = DOWNLOAD_DIR / f"{slug}.epub"
-        m4b_path = AUDIOBOOK_DIR / f"{slug}.m4b"
-
-        if m4b_path.exists():
-            print(f"  [{i}/{len(books)}] {bk['title']}")
-            print("    → skip (m4b already exists)")
-            skipped += 1
-        elif not epub_path.exists():
-            print(f"  [{i}/{len(books)}] {bk['title']}")
-            print("    → skip (epub not found)")
-        else:
-            to_convert.append((i, bk, epub_path, m4b_path))
-
-    if not to_convert:
-        print(f"\n  Done — 0 converted, {skipped} skipped, 0 failed.")
-        return
-
-    ok = 0
-    failures: list[tuple[str, str]] = []  # (title, error message)
-    for i, bk, epub_path, m4b_path in to_convert:
-        print(f"  [{i}/{len(books)}] {bk['title']}")
-        try:
-            result = convert_epub_to_m4b(epub_path, m4b_path)
-            mb = result.stat().st_size / (1024 * 1024)
-            print(f"    → {mb:.1f} MB ✓")
-            ok += 1
-        except Exception as exc:
-            print(f"    → FAILED ({exc})")
-            failures.append((bk["title"], str(exc)))
-
-    print(f"\n  Done — {ok} converted, {skipped} skipped, {len(failures)} failed.")
-    if failures:
-        print("\n  Failed conversions:")
-        for title, err in failures:
-            print(f"    • {title}: {err}")
+def _instantiate_ui(name: str):
+    """Instantiate the chosen UI, falling back to PlainUI on curses failure."""
+    try:
+        ui_cls = get_ui(name)
+        return ui_cls()
+    except Exception as exc:  # pylint: disable=broad-except
+        if name == "plain":
+            raise
+        print(
+            f"Failed to initialise '{name}' UI ({exc}); falling back to plain.",
+            file=sys.stderr,
+        )
+        return PlainUI()
 
 
 # ── main ─────────────────────────────────────────────────────────────
@@ -449,8 +192,8 @@ def main() -> None:
     if args.bake_credentials:
         sys.exit(run_bake_credentials())
 
-    # Phase 1: login + fetch (normal terminal)
-    api, me = ensure_login()
+    # Phase 1: login + fetch
+    api, _me = ensure_login()
     print("Fetching library … ", end="", flush=True)
     lib = api.library(limit=500)
     books_raw = lib.get("books", [])
@@ -458,35 +201,64 @@ def main() -> None:
     total = sum(len(s["books"]) for s in grouped.values())
     print(f"{total} books across {len(grouped)} series.\n")
 
+    controller = LibraryController(DOWNLOAD_DIR, AUDIOBOOK_DIR)
+
     if args.download_all:
         downloadable = collect_downloadable_books(grouped)
         if not downloadable:
             print("No downloadable EPUBs found in library.")
             return
 
-        print(f"Downloading all missing EPUBs ({len(downloadable)} total with links) …\n")
-        run_downloads(downloadable)
+        print(
+            f"Downloading all missing EPUBs ({len(downloadable)} total with links) …"
+        )
+        controller.run_downloads(downloadable, PlainUI())
         return
 
     entries = build_entries(grouped)
+    extras_entry = build_extras_entry(EXTRAS_DIR)
+    if extras_entry:
+        entries.append(extras_entry)
+        print(f"Found {len(extras_entry.books)} local extra(s) in {EXTRAS_DIR}/.")
 
-    # Phase 2: curses TUI
-    result = curses.wrapper(lambda win: series_list_view(win, entries))
+    # Phase 2: interactive UI
+    backend = resolve_backend(args)
+    ui = _instantiate_ui(backend)
+    try:
+        action = ui.run(entries)
+    except Exception as exc:  # pylint: disable=broad-except
+        if isinstance(ui, PlainUI):
+            raise
+        print(
+            f"\nUI '{backend}' crashed ({exc}); retrying with plain backend.",
+            file=sys.stderr,
+        )
+        ui = PlainUI()
+        action = ui.run(entries)
 
-    # Phase 3: download (normal terminal again)
-    if result in ("download", "convert"):
+    # Phase 3: dispatch
+    if action == Action.EXTEND:
+        book = ui.pending_action_book
+        if book is None:
+            ui.on_error("EXTEND requested but no book was selected.")
+            return
+        controller.run_single_extend(book, ui)
+    elif action == Action.BAKE:
+        book = ui.pending_action_book
+        if book is None:
+            ui.on_error("BAKE requested but no book was selected.")
+            return
+        controller.run_single_bake(book, ui)
+    elif action in (Action.DOWNLOAD, Action.CONVERT):
         selected = gather_selected_books(entries)
         if not selected:
-            print("Nothing selected.")
-        else:
-            print(f"\nDownloading {len(selected)} volume(s) …\n")
-            run_downloads(selected)
-
-            if result == "convert":
-                print(f"\nConverting {len(selected)} volume(s) to M4B …\n")
-                run_conversions(selected)
+            ui.on_info("Nothing selected.")
+            return
+        controller.run_downloads(selected, ui)
+        if action == Action.CONVERT:
+            controller.run_conversions(selected, ui)
     else:
-        print("Bye!")
+        ui.on_info("Bye!")
 
 
 if __name__ == "__main__":
